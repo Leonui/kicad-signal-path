@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kicad-signal-path"
+dynamic = ["version"]
+description = "Measure exact routed pad-to-pad signal lengths from KiCad PCB files."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Ang", email = "mail@angme.org" },
+]
+maintainers = [
+  { name = "Ang", email = "mail@angme.org" },
+]
+keywords = ["kicad", "pcb", "eda", "signal-integrity", "length-matching"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Leonui/kicad-signal-path"
+Repository = "https://github.com/Leonui/kicad-signal-path"
+Issues = "https://github.com/Leonui/kicad-signal-path/issues"
+Changelog = "https://github.com/Leonui/kicad-signal-path/releases"
+
+[project.scripts]
+kicad-signal-path = "kicad_signal_path.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+]
+
+[tool.hatch.version]
+path = "src/kicad_signal_path/__init__.py"
+
+[tool.hatch.build]
+exclude = [
+  "**/*.kicad_pcb",
+  "**/*.kicad_sch",
+  "**/*.kicad_pro",
+  "**/*.kicad_prl",
+  "**/*.kicad_dru",
+  "**/*.gbr",
+  "**/*.gbrjob",
+  "**/gerber/**",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kicad_signal_path"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/README.md",
+  "/LICENSE",
+  "/pyproject.toml",
+]
+exclude = [
+  "/.github",
+  "/.gitignore",
+  "/.python-version",
+  "/tests",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
