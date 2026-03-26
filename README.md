@@ -95,7 +95,7 @@ uv run --isolated --no-project --with dist/*.tar.gz tests/smoke_test.py
 This repo is prepared for public PyPI publishing with `uv` and GitHub Actions.
 
 1. Create the PyPI project `kicad-signal-path`.
-2. In PyPI trusted publishing, allow GitHub repository `Leonui/kicad-signal-path`.
+2. In PyPI trusted publishing, allow your GitHub repository for this package.
 3. Set the trusted publishing workflow to `.github/workflows/publish.yml`.
 4. Set the trusted publishing environment name to `pypi`.
 5. Push a version tag such as `v0.1.0`.
