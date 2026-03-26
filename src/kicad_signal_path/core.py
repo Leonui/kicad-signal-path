@@ -13,6 +13,7 @@ import re
 import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Iterable
 
@@ -35,6 +36,7 @@ class BoardParseError(RuntimeError):
 
 
 SExp = list["SExp | str"] | str
+AUTO_PASS_THROUGH_REF_GLOBS = ("R*",)
 
 
 def tokenize(text: str) -> list[str]:
@@ -192,7 +194,13 @@ class Stackup:
     copper_layers: tuple[str, ...]
     copper_z_mm: dict[str, float]
 
+    @property
+    def has_via_height_data(self) -> bool:
+        return all(layer in self.copper_z_mm for layer in self.copper_layers)
+
     def via_length(self, start_layer: str, end_layer: str) -> float:
+        if start_layer not in self.copper_z_mm or end_layer not in self.copper_z_mm:
+            raise ValueError("board stackup does not define copper heights")
         return abs(self.copper_z_mm[end_layer] - self.copper_z_mm[start_layer])
 
     def copper_span(self, start_layer: str, end_layer: str) -> tuple[str, ...]:
@@ -301,6 +309,7 @@ class Edge:
 @dataclass(frozen=True)
 class BoardModel:
     stackup: Stackup
+    nets_by_ordinal: dict[str, str]
     pads: tuple[Pad, ...]
     tracks: tuple[Track, ...]
     vias: tuple[Via, ...]
@@ -363,11 +372,59 @@ class DisjointSet:
             self.rank[left_root] += 1
 
 
-def parse_stackup(root: SExp) -> Stackup:
+def parse_net_table(root: SExp) -> dict[str, str]:
+    nets_by_ordinal: dict[str, str] = {}
+    for node in child_nodes(root, "net"):
+        ordinal = atom(node, 1)
+        if ordinal is None or not ordinal.isdigit():
+            continue
+        nets_by_ordinal[ordinal] = atom(node, 2, "") or ""
+    return nets_by_ordinal
+
+
+def resolve_net_name(node: list[SExp | str] | None, nets_by_ordinal: dict[str, str]) -> str | None:
+    ordinal = atom(node, 1)
+    if ordinal is None:
+        return None
+
+    if not ordinal.isdigit():
+        return ordinal or None
+
+    inline_name = atom(node, 2)
+    if inline_name is not None:
+        known_name = nets_by_ordinal.get(ordinal)
+        if known_name is not None and known_name != inline_name:
+            raise BoardParseError(f"net ordinal '{ordinal}' maps to both '{known_name}' and '{inline_name}'")
+        return inline_name or None
+
+    if ordinal not in nets_by_ordinal:
+        raise BoardParseError(f"net ordinal '{ordinal}' was referenced but not defined in the board net table")
+
+    return nets_by_ordinal[ordinal] or None
+
+
+def parse_board_copper_layers(root: SExp) -> tuple[str, ...]:
+    layers_node = first_child(root, "layers")
+    if layers_node is None:
+        return ()
+
+    copper_layers: list[str] = []
+    for entry in layers_node[1:]:
+        if not isinstance(entry, list):
+            continue
+        layer_name = atom(entry, 1)
+        if layer_name and layer_name.endswith(".Cu"):
+            copper_layers.append(layer_name)
+    return tuple(copper_layers)
+
+
+def parse_stackup(root: SExp, fallback_copper_layers: tuple[str, ...]) -> Stackup:
     setup = first_child(root, "setup")
     stackup_node = first_child(setup, "stackup") if setup else None
     if stackup_node is None:
-        raise BoardParseError("board setup stackup not found")
+        if not fallback_copper_layers:
+            raise BoardParseError("board copper layers could not be determined")
+        return Stackup(copper_layers=fallback_copper_layers, copper_z_mm={})
 
     copper_layers: list[str] = []
     copper_z_mm: dict[str, float] = {}
@@ -376,26 +433,32 @@ def parse_stackup(root: SExp) -> Stackup:
         layer_name = atom(layer_node, 1)
         if layer_name is None:
             continue
+        if layer_name == "dielectric":
+            dielectric_id = atom(layer_node, 2)
+            if dielectric_id:
+                layer_name = f"dielectric {dielectric_id}"
         layer_type = atom(first_child(layer_node, "type"), 1)
         thickness_mm = float_atom(first_child(layer_node, "thickness"), 1, 0.0) or 0.0
         if layer_type == "copper":
             copper_layers.append(layer_name)
             copper_z_mm[layer_name] = z_mm + (thickness_mm / 2.0)
             z_mm += thickness_mm
-        elif layer_name.startswith("dielectric "):
+        else:
             z_mm += thickness_mm
 
     if not copper_layers:
-        raise BoardParseError("no copper layers found in stackup")
+        if not fallback_copper_layers:
+            raise BoardParseError("no copper layers found in stackup")
+        return Stackup(copper_layers=fallback_copper_layers, copper_z_mm={})
 
     return Stackup(copper_layers=tuple(copper_layers), copper_z_mm=copper_z_mm)
 
 
-def parse_tracks(root: SExp) -> tuple[Track, ...]:
+def parse_tracks(root: SExp, nets_by_ordinal: dict[str, str]) -> tuple[Track, ...]:
     result: list[Track] = []
     for kind in ("segment", "arc"):
         for node in child_nodes(root, kind):
-            net = atom(first_child(node, "net"), 1)
+            net = resolve_net_name(first_child(node, "net"), nets_by_ordinal)
             layer = atom(first_child(node, "layer"), 1)
             start_node = first_child(node, "start")
             end_node = first_child(node, "end")
@@ -422,10 +485,10 @@ def parse_tracks(root: SExp) -> tuple[Track, ...]:
     return tuple(result)
 
 
-def parse_vias(root: SExp) -> tuple[Via, ...]:
+def parse_vias(root: SExp, nets_by_ordinal: dict[str, str]) -> tuple[Via, ...]:
     result: list[Via] = []
     for node in child_nodes(root, "via"):
-        net = atom(first_child(node, "net"), 1)
+        net = resolve_net_name(first_child(node, "net"), nets_by_ordinal)
         at_node = first_child(node, "at")
         layers_node = first_child(node, "layers")
         if not net or not at_node or layers_node is None or len(layers_node) < 3:
@@ -436,7 +499,7 @@ def parse_vias(root: SExp) -> tuple[Via, ...]:
     return tuple(result)
 
 
-def parse_pads(root: SExp, stackup: Stackup) -> tuple[Pad, ...]:
+def parse_pads(root: SExp, stackup: Stackup, nets_by_ordinal: dict[str, str]) -> tuple[Pad, ...]:
     result: list[Pad] = []
     for footprint in child_nodes(root, "footprint"):
         reference = None
@@ -475,7 +538,7 @@ def parse_pads(root: SExp, stackup: Stackup) -> tuple[Pad, ...]:
             center = (fp_x + rotated_at[0], fp_y + rotated_at[1])
             size = (float_atom(size_node, 1, 0.0) or 0.0, float_atom(size_node, 2, 0.0) or 0.0)
             layers = tuple(value for value in layers_node[1:] if isinstance(value, str))
-            net = atom(first_child(pad_node, "net"), 1)
+            net = resolve_net_name(first_child(pad_node, "net"), nets_by_ordinal)
             pinfunction = atom(first_child(pad_node, "pinfunction"), 1)
 
             pad = Pad(
@@ -501,12 +564,15 @@ def load_board(path: Path) -> BoardModel:
     root = parse_sexp(path.read_text(encoding="utf-8"))
     if not isinstance(root, list) or not root or root[0] != "kicad_pcb":
         raise BoardParseError("root expression is not a kicad_pcb board")
-    stackup = parse_stackup(root)
+    nets_by_ordinal = parse_net_table(root)
+    copper_layers = parse_board_copper_layers(root)
+    stackup = parse_stackup(root, copper_layers)
     return BoardModel(
         stackup=stackup,
-        pads=parse_pads(root, stackup),
-        tracks=parse_tracks(root),
-        vias=parse_vias(root),
+        nets_by_ordinal=nets_by_ordinal,
+        pads=parse_pads(root, stackup, nets_by_ordinal),
+        tracks=parse_tracks(root, nets_by_ordinal),
+        vias=parse_vias(root, nets_by_ordinal),
     )
 
 
@@ -552,14 +618,50 @@ def expand_dst_template(template: str, match: re.Match[str], board_nets: set[str
 
 def find_bridge_footprints(board: BoardModel, left_net: str, right_net: str) -> set[str]:
     pads_by_footprint = group_pads_by_footprint(board)
+    ref_by_uuid, _ = build_footprint_ref_maps(board)
     bridge_footprints: set[str] = set()
     for footprint_uuid, pads in pads_by_footprint.items():
         if len(pads) != 2:
+            continue
+        ref = ref_by_uuid.get(footprint_uuid)
+        if ref is None or not any(fnmatchcase(ref, pattern) for pattern in AUTO_PASS_THROUGH_REF_GLOBS):
             continue
         pad_nets = {pad.net for pad in pads if pad.net}
         if pad_nets == {left_net, right_net}:
             bridge_footprints.add(footprint_uuid)
     return bridge_footprints
+
+
+def nets_for_pass_through_footprints(board: BoardModel, footprint_uuids: set[str]) -> set[str]:
+    pads_by_footprint = group_pads_by_footprint(board)
+    nets: set[str] = set()
+    for footprint_uuid in footprint_uuids:
+        for pad in pads_by_footprint.get(footprint_uuid, []):
+            if pad.net:
+                nets.add(pad.net)
+    return nets
+
+
+def labels_for_footprints(board: BoardModel, footprint_uuids: set[str]) -> list[str]:
+    ref_by_uuid, uuids_by_ref = build_footprint_ref_maps(board)
+    return [
+        footprint_display_name(footprint_uuid, ref_by_uuid, uuids_by_ref)
+        for footprint_uuid in sorted(footprint_uuids)
+    ]
+
+
+def select_pass_through_footprints(
+    board: BoardModel,
+    left_net: str | None,
+    right_net: str | None,
+    explicit_pass_through_footprints: set[str],
+    auto_pass_through: bool,
+) -> tuple[set[str], set[str]]:
+    auto_pass_through_footprints: set[str] = set()
+    if auto_pass_through and left_net and right_net:
+        auto_pass_through_footprints = find_bridge_footprints(board, left_net, right_net) - explicit_pass_through_footprints
+    all_pass_through_footprints = explicit_pass_through_footprints | auto_pass_through_footprints
+    return all_pass_through_footprints, auto_pass_through_footprints
 
 
 def resolve_pass_through_footprints(board: BoardModel, selectors: set[str]) -> set[str]:
@@ -624,6 +726,7 @@ def resolve_regex_measurements(
     explicit_pass_through_refs: set[str],
     include_via_length: bool,
     allow_alternative_paths: bool,
+    auto_pass_through: bool = True,
 ) -> list[dict[str, object]]:
     compiled, use_fullmatch = compile_src_net_regex(src_net_regex)
     board_nets = {pad.net for pad in board.pads if pad.net}
@@ -648,12 +751,15 @@ def resolve_regex_measurements(
         if destination_net not in board_nets:
             raise ValueError(f"destination net '{destination_net}' derived from '{source_net}' was not found")
 
-        auto_bridge_footprints = find_bridge_footprints(board, source_net, destination_net)
-        pass_through_footprints = explicit_pass_through_footprints | auto_bridge_footprints
-        pass_through_labels = [
-            footprint_display_name(footprint_uuid, ref_by_uuid, uuids_by_ref)
-            for footprint_uuid in sorted(pass_through_footprints)
-        ]
+        pass_through_footprints, auto_pass_through_footprints = select_pass_through_footprints(
+            board=board,
+            left_net=source_net,
+            right_net=destination_net,
+            explicit_pass_through_footprints=explicit_pass_through_footprints,
+            auto_pass_through=auto_pass_through,
+        )
+        pass_through_labels = labels_for_footprints(board, pass_through_footprints)
+        auto_pass_through_labels = labels_for_footprints(board, auto_pass_through_footprints)
 
         try:
             start_pad = resolve_unique_pad_for_net(board, source_net, pass_through_footprints)
@@ -663,6 +769,7 @@ def resolve_regex_measurements(
                 start_selector=pad_display_name(start_pad, ref_by_uuid, uuids_by_ref),
                 end_selector=pad_display_name(end_pad, ref_by_uuid, uuids_by_ref),
                 allowed_pass_through_refs=explicit_pass_through_refs,
+                auto_pass_through=auto_pass_through,
                 include_via_length=include_via_length,
                 allow_alternative_paths=allow_alternative_paths,
             )
@@ -691,6 +798,7 @@ def resolve_regex_measurements(
                     "via_length_mm": None,
                     "total_length_mm": None,
                     "pass_through_refs": pass_through_labels,
+                    "auto_pass_through_refs": auto_pass_through_labels,
                     "nets_visited": [],
                     "path_edges": [],
                     "source_net": source_net,
@@ -787,7 +895,9 @@ def build_graph(
             point_nodes_by_layer[layer].add(node)
             via_nodes.append(node)
         for left_layer, right_layer, left_node, right_node in zip(copper_span, copper_span[1:], via_nodes, via_nodes[1:]):
-            raw_via_mm = board.stackup.via_length(left_layer, right_layer)
+            raw_via_mm = 0.0
+            if board.stackup.has_via_height_data:
+                raw_via_mm = board.stackup.via_length(left_layer, right_layer)
             add_edge(
                 left_node,
                 right_node,
@@ -958,13 +1068,20 @@ def measure(
     allowed_pass_through_refs: set[str],
     include_via_length: bool,
     allow_alternative_paths: bool,
+    auto_pass_through: bool = True,
 ) -> dict[str, object]:
     start_pad = resolve_pad(board, start_selector)
     end_pad = resolve_pad(board, end_selector)
     ref_by_uuid, uuids_by_ref = build_footprint_ref_maps(board)
     explicit_pass_through_footprints = resolve_pass_through_footprints(board, set(allowed_pass_through_refs))
-    auto_bridge_footprints = find_bridge_footprints(board, start_pad.net or "", end_pad.net or "")
-    all_pass_through_footprints = explicit_pass_through_footprints | auto_bridge_footprints
+    all_pass_through_footprints, auto_pass_through_footprints = select_pass_through_footprints(
+        board=board,
+        left_net=start_pad.net,
+        right_net=end_pad.net,
+        explicit_pass_through_footprints=explicit_pass_through_footprints,
+        auto_pass_through=auto_pass_through,
+    )
+    auto_pass_through_labels = set(labels_for_footprints(board, auto_pass_through_footprints))
 
     adjacency, reverse_nodes, edges, endpoint_nodes = build_graph(
         board=board,
@@ -973,7 +1090,21 @@ def measure(
         allowed_pass_through_footprints=all_pass_through_footprints,
         include_via_length=include_via_length,
     )
-    total_cost_mm, path_edges = shortest_path(adjacency, endpoint_nodes["start"], endpoint_nodes["end"])
+    if include_via_length and not board.stackup.has_via_height_data:
+        via_edge_ids = {edge.edge_id for edge in edges if edge.kind == "via"}
+        try:
+            total_cost_mm, path_edges = shortest_path(
+                adjacency,
+                endpoint_nodes["start"],
+                endpoint_nodes["end"],
+                banned_edge_ids=via_edge_ids,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "board stackup does not define via heights for the selected path; rerun with --exclude-via-height to ignore via height"
+            ) from exc
+    else:
+        total_cost_mm, path_edges = shortest_path(adjacency, endpoint_nodes["start"], endpoint_nodes["end"])
 
     chosen_weighted_edge_ids = {edge.edge_id for edge in path_edges if (edge.track_mm > 0.0 or edge.via_mm > 0.0)}
     if not allow_alternative_paths and has_alternative_path(
@@ -988,6 +1119,7 @@ def measure(
     track_length_mm = sum(edge.track_mm for edge in path_edges)
     via_length_mm = sum(edge.via_mm for edge in path_edges)
     crossed_components = unique_sequence(edge.detail for edge in path_edges if edge.kind == "pass_through")
+    auto_crossed_components = [label for label in crossed_components if label in auto_pass_through_labels]
     nets_visited = unique_sequence(edge.net for edge in path_edges if edge.net)
 
     return {
@@ -997,6 +1129,7 @@ def measure(
         "via_length_mm": via_length_mm,
         "total_length_mm": total_cost_mm,
         "pass_through_refs": crossed_components,
+        "auto_pass_through_refs": auto_crossed_components,
         "nets_visited": nets_visited,
         "path_edges": path_edges,
         "source_net": start_pad.net,
@@ -1012,6 +1145,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   kicad-signal-path v1.kicad_pcb --start U1:B3 --end J1:H23
+  kicad-signal-path v1.kicad_pcb --start U1:B3 --end J1:H23 --auto-pass-through
   kicad-signal-path v1.kicad_pcb --start U1:B3 --end J1:H23 --verbose
   kicad-signal-path v1.kicad_pcb --src-net-regex '/AXIS_I_(.*)/' --dst-net-template '/FMC_AXIS_I_($1)/'
   kicad-signal-path v1.kicad_pcb --src-net-regex '/FMC_AXIS_O_(.*)/' --dst-net-template '/AXIS_O_($1)/'
@@ -1025,6 +1159,9 @@ Report notes:
   Delta mm is measured against the shortest successful matched row.
   Max diff is the longest successful total minus the shortest successful total.
   Regex batch mode keeps successful rows and marks failed rows as ERROR.
+  Pass-through parts are crossed when explicitly listed with --pass-through or auto-selected by default.
+  Auto selection only considers exact 2-pin resistor-style refs matching R*.
+  Use --no-auto-pass-through to disable auto selection.
 """,
     )
     parser.add_argument("board", type=Path, help="Path to the KiCad .kicad_pcb file to inspect.")
@@ -1043,7 +1180,20 @@ Report notes:
         dest="pass_through_refs",
         action="append",
         default=[],
-        help="2-pin bridge selector to treat as a zero-length pass-through. Use REF when unique, or REF@uuid8 when duplicated. Repeat for multiple selectors.",
+        help="2-pin bridge selector to treat as a zero-length pass-through. Explicit selectors are always included in addition to any default auto-selected resistor-style bridges. Use REF when unique, or REF@uuid8 when duplicated. Repeat for multiple selectors.",
+    )
+    parser.add_argument(
+        "--auto-pass-through",
+        dest="auto_pass_through",
+        action="store_true",
+        default=True,
+        help="Auto-select exact 2-pin bridge parts for the chosen net pair, limited to refs matching R*. This is enabled by default.",
+    )
+    parser.add_argument(
+        "--no-auto-pass-through",
+        dest="auto_pass_through",
+        action="store_false",
+        help="Disable default auto-selection of resistor-style pass-through bridges.",
     )
     parser.add_argument(
         "--exclude-via-height",
@@ -1079,6 +1229,18 @@ def shorten_cell(value: str, max_width: int) -> str:
     if max_width <= 3:
         return value[:max_width]
     return value[: max_width - 3] + "..."
+
+
+def format_bridge_cell(result: dict[str, object]) -> str:
+    pass_through_refs = list(result.get("pass_through_refs", []))
+    if not pass_through_refs:
+        return "(none)"
+
+    auto_refs = set(result.get("auto_pass_through_refs", []))
+    return ", ".join(
+        f"{ref} (auto)" if ref in auto_refs else ref
+        for ref in pass_through_refs
+    )
 
 
 def render_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -1155,7 +1317,7 @@ def render_results_table(results: list[dict[str, object]], include_via_length: b
                 format_length_cell(result["via_length_mm"]),
                 format_length_cell(result["total_length_mm"]),
                 format_length_cell(delta_mm),
-                shorten_cell(", ".join(result["pass_through_refs"]) if result["pass_through_refs"] else "(none)", 16),
+                shorten_cell(format_bridge_cell(result), 24),
                 str(result.get("status", "OK")),
             ]
         )
@@ -1176,6 +1338,7 @@ def main(argv: list[str] | None = None) -> int:
                 allowed_pass_through_refs=set(args.pass_through_refs),
                 include_via_length=not args.exclude_via_height,
                 allow_alternative_paths=args.allow_alternative_paths,
+                auto_pass_through=args.auto_pass_through,
             )
             results = [result]
         elif args.src_net_regex and args.dst_net_template:
@@ -1186,6 +1349,7 @@ def main(argv: list[str] | None = None) -> int:
                 explicit_pass_through_refs=set(args.pass_through_refs),
                 include_via_length=not args.exclude_via_height,
                 allow_alternative_paths=args.allow_alternative_paths,
+                auto_pass_through=args.auto_pass_through,
             )
         else:
             raise ValueError("use either --start/--end or --src-net-regex/--dst-net-template")

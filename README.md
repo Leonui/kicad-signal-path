@@ -6,7 +6,8 @@ It supports:
 
 - single pad-to-pad path measurement
 - regex-based source and destination net matching
-- automatic 2-pin bridge detection for series resistors and similar pass-through parts
+- explicit 2-pin pass-through selection for series resistors and similar zero-length bridge parts
+- default auto pass-through discovery for exact 2-pin resistor-style refs matching `R*`
 - separate `Track mm`, `Via mm`, `Total mm`, and `Delta mm` reporting
 - CLI and Python usage from the same package
 
@@ -56,6 +57,8 @@ kicad-signal-path \
   --end J1:H23 \
   --verbose
 ```
+
+Pass-through parts are traversed when explicitly listed with `--pass-through` or selected automatically by default. Auto selection is intentionally constrained to exact 2-pin resistor-style refs matching `R*`. Use `--no-auto-pass-through` to disable it.
 
 Use the module form if you prefer:
 

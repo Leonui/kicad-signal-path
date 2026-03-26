@@ -14,7 +14,7 @@ from board_factory import write_sample_board
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
-        board_path = write_sample_board(Path(temp_dir) / "synthetic_board.txt")
+        board_path = write_sample_board(Path(temp_dir) / "synthetic_board.kicad_pcb")
 
         help_result = subprocess.run(
             [sys.executable, "-m", "kicad_signal_path", "--help"],
@@ -44,6 +44,8 @@ def main() -> None:
             raise AssertionError("Measurement output did not contain the expected source net")
         if "20.000000" not in measure_result.stdout:
             raise AssertionError("Measurement output did not contain the expected total length")
+        if "R1 (auto)" not in measure_result.stdout:
+            raise AssertionError("Measurement output did not show the expected auto-selected bridge")
 
 
 if __name__ == "__main__":
