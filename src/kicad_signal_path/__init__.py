@@ -1,5 +1,7 @@
 """Public package interface for the ``kicad-signal-path`` package."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from .core import (
     BoardParseError,
     build_arg_parser,
@@ -24,4 +26,11 @@ __all__ = [
     "summarize_results",
 ]
 
-__version__ = "0.1.0"
+try:
+    from ._version import __version__, __version_tuple__
+except ImportError:
+    __version_tuple__ = ()
+    try:
+        __version__ = version("kicad-signal-path")
+    except PackageNotFoundError:
+        __version__ = "0+unknown"

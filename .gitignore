@@ -8,6 +8,7 @@ __pycache__/
 uv.lock
 build/
 dist/
+src/kicad_signal_path/_version.py
 htmlcov/
 .DS_Store
 *.kicad_pcb

@@ -98,11 +98,14 @@ This repo is prepared for public PyPI publishing with `uv` and GitHub Actions.
 2. In PyPI trusted publishing, allow your GitHub repository for this package.
 3. Set the trusted publishing workflow to `.github/workflows/publish.yml`.
 4. Set the trusted publishing environment name to `pypi`.
-5. Push a version tag such as `v0.1.0`.
+5. Create and push an annotated release tag such as `v0.1.2` on the commit you want to publish.
+6. The package version is derived from that git tag during build, so the tag must match the intended release version.
 
-Manual local publish also works after authentication is configured:
+Manual local publish also works after authentication is configured, but build from the tagged commit so the derived version is exact:
 
 ```bash
+rm -rf dist/
+uv build --no-sources
 uv publish
 ```
 
