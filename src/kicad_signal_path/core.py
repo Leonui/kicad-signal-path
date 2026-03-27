@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import logging
 import math
 import re
 import sys
@@ -15,8 +16,19 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
+from .types import GraphEndpoints, MeasurementResult, SExp, SummaryMetrics
+from .validation import (
+    MAX_PATHFINDING_TIME_SECONDS,
+    TimeoutChecker,
+    validate_file_size,
+    validate_graph_size,
+    validate_recursion_depth,
+)
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "BoardParseError",
@@ -32,11 +44,34 @@ __all__ = [
 
 
 class BoardParseError(RuntimeError):
+    """Raised when KiCad PCB file parsing fails."""
     pass
 
 
-SExp = list["SExp | str"] | str
+# Floating-point comparison tolerance
+# This epsilon is chosen to handle accumulated rounding errors in geometric calculations
+# while being small enough to distinguish meaningful differences in PCB dimensions.
+# PCB coordinates are typically in millimeters with micrometer precision.
+EPSILON = 1e-9  # ~1 nanometer, well below PCB manufacturing tolerances
+
+# Auto pass-through component reference patterns
 AUTO_PASS_THROUGH_REF_GLOBS = ("R*",)
+
+# Pad containment tolerance in millimeters
+# Allows for small numerical errors when checking if a point lies within a pad
+PAD_TOLERANCE_MM = 0.02  # 20 micrometers
+
+
+def is_zero(value: float) -> bool:
+    """Check if a floating-point value is effectively zero.
+
+    Args:
+        value: The value to check
+
+    Returns:
+        True if abs(value) < EPSILON, False otherwise
+    """
+    return abs(value) < EPSILON
 
 
 def tokenize(text: str) -> list[str]:
@@ -82,11 +117,35 @@ def tokenize(text: str) -> list[str]:
 
 
 def parse_sexp(text: str) -> SExp:
+    """Parse S-expression text into a nested list structure.
+
+    Args:
+        text: S-expression text to parse
+
+    Returns:
+        Parsed S-expression as nested lists and strings
+
+    Raises:
+        BoardParseError: If parsing fails due to malformed input
+    """
     tokens = tokenize(text)
     index = 0
 
-    def parse_expr() -> SExp:
+    def parse_expr(depth: int = 0) -> SExp:
+        """Recursively parse S-expression with depth tracking.
+
+        Args:
+            depth: Current recursion depth
+
+        Returns:
+            Parsed S-expression node
+
+        Raises:
+            BoardParseError: If parsing fails
+        """
         nonlocal index
+        validate_recursion_depth(depth)
+
         if index >= len(tokens):
             raise BoardParseError("unexpected end of file")
         token = tokens[index]
@@ -94,7 +153,7 @@ def parse_sexp(text: str) -> SExp:
         if token == "(":
             result: list[SExp] = []
             while index < len(tokens) and tokens[index] != ")":
-                result.append(parse_expr())
+                result.append(parse_expr(depth + 1))
             if index >= len(tokens):
                 raise BoardParseError("missing closing parenthesis")
             index += 1
@@ -103,7 +162,7 @@ def parse_sexp(text: str) -> SExp:
             raise BoardParseError("unexpected closing parenthesis")
         return token
 
-    parsed = parse_expr()
+    parsed = parse_expr(0)
     if index != len(tokens):
         raise BoardParseError("trailing tokens after root expression")
     return parsed
@@ -238,7 +297,7 @@ class Pad:
             return stackup.copper_layers
         return tuple(layer for layer in self.layers if layer in stackup.copper_layers)
 
-    def contains_point(self, point_mm: tuple[float, float], layer: str, stackup: Stackup, tolerance_mm: float = 0.02) -> bool:
+    def contains_point(self, point_mm: tuple[float, float], layer: str, stackup: Stackup, tolerance_mm: float = PAD_TOLERANCE_MM) -> bool:
         if layer not in self.copper_layers(stackup):
             return False
 
@@ -561,18 +620,47 @@ def parse_pads(root: SExp, stackup: Stackup, nets_by_ordinal: dict[str, str]) ->
 
 
 def load_board(path: Path) -> BoardModel:
-    root = parse_sexp(path.read_text(encoding="utf-8"))
+    """Load and parse a KiCad PCB file.
+
+    Args:
+        path: Path to the .kicad_pcb file
+
+    Returns:
+        Parsed board model
+
+    Raises:
+        BoardParseError: If parsing fails
+        ValidationError: If file validation fails
+    """
+    logger.info(f"Loading KiCad PCB file: {path}")
+    validate_file_size(path)
+
+    text = path.read_text(encoding="utf-8")
+    logger.debug(f"File size: {len(text)} characters")
+
+    root = parse_sexp(text)
     if not isinstance(root, list) or not root or root[0] != "kicad_pcb":
         raise BoardParseError("root expression is not a kicad_pcb board")
+
     nets_by_ordinal = parse_net_table(root)
+    logger.debug(f"Found {len(nets_by_ordinal)} nets")
+
     copper_layers = parse_board_copper_layers(root)
+    logger.debug(f"Found {len(copper_layers)} copper layers: {copper_layers}")
+
     stackup = parse_stackup(root, copper_layers)
+    pads = parse_pads(root, stackup, nets_by_ordinal)
+    tracks = parse_tracks(root, nets_by_ordinal)
+    vias = parse_vias(root, nets_by_ordinal)
+
+    logger.info(f"Loaded board: {len(pads)} pads, {len(tracks)} tracks, {len(vias)} vias")
+
     return BoardModel(
         stackup=stackup,
         nets_by_ordinal=nets_by_ordinal,
-        pads=parse_pads(root, stackup, nets_by_ordinal),
-        tracks=parse_tracks(root, nets_by_ordinal),
-        vias=parse_vias(root, nets_by_ordinal),
+        pads=pads,
+        tracks=tracks,
+        vias=vias,
     )
 
 
@@ -919,7 +1007,7 @@ def build_graph(
                 if pad.net and pad.net not in point_node_nets[point_node]:
                     continue
                 point_key = reverse_nodes[point_node]
-                point = (float(point_key[2]), float(point_key[3]))
+                point = (float(point_key[2]), float(point_key[3]))  # type: ignore[arg-type]
                 if pad.contains_point(point, layer, board.stackup):
                     add_edge(
                         anchor_node,
@@ -962,6 +1050,14 @@ def build_graph(
     if end_node not in adjacency:
         raise ValueError(f"end pad '{pad_display_name(end_pad, ref_by_uuid, uuids_by_ref)}' has no routed copper touching it")
 
+    # Validate graph size
+    node_count = len(reverse_nodes)
+    edge_count = len(edges)
+    validate_graph_size(node_count, edge_count)
+
+    logger.info(f"Built routing graph: {node_count} nodes, {edge_count} edges")
+    logger.debug(f"Start node: {start_node}, End node: {end_node}")
+
     endpoint_nodes = {"start": start_node, "end": end_node}
     return adjacency, reverse_nodes, edges, endpoint_nodes
 
@@ -971,23 +1067,52 @@ def shortest_path(
     start: int,
     end: int,
     banned_edge_ids: set[int] | None = None,
+    timeout_seconds: float = MAX_PATHFINDING_TIME_SECONDS,
 ) -> tuple[float, list[Edge]]:
+    """Find shortest path using Dijkstra's algorithm.
+
+    Time complexity: O(E log V) where E is edges and V is vertices.
+
+    Args:
+        adjacency: Graph adjacency list mapping node IDs to (neighbor, edge) tuples
+        start: Starting node ID
+        end: Ending node ID
+        banned_edge_ids: Set of edge IDs to exclude from the path
+        timeout_seconds: Maximum execution time in seconds
+
+    Returns:
+        Tuple of (total_distance, path_edges)
+
+    Raises:
+        ValueError: If no path exists
+        TimeoutError: If pathfinding exceeds timeout
+    """
     banned_edge_ids = banned_edge_ids or set()
     queue: list[tuple[float, int]] = [(0.0, start)]
     distances: dict[int, float] = {start: 0.0}
     previous: dict[int, tuple[int, Edge]] = {}
+    timeout_checker = TimeoutChecker(timeout_seconds)
+    iterations = 0
+
+    logger.debug(f"Starting pathfinding from node {start} to {end}")
 
     while queue:
+        # Check timeout periodically (every 1000 iterations)
+        iterations += 1
+        if iterations % 1000 == 0:
+            timeout_checker.check()
+
         current_distance, node = heapq.heappop(queue)
-        if current_distance > distances.get(node, math.inf) + 1e-12:
+        if current_distance > distances.get(node, math.inf) + EPSILON:
             continue
         if node == end:
+            logger.debug(f"Found path in {iterations} iterations")
             break
         for neighbor, edge in adjacency.get(node, []):
             if edge.edge_id in banned_edge_ids:
                 continue
             next_distance = current_distance + edge.cost_mm
-            if next_distance + 1e-12 < distances.get(neighbor, math.inf):
+            if next_distance + EPSILON < distances.get(neighbor, math.inf):
                 distances[neighbor] = next_distance
                 previous[neighbor] = (node, edge)
                 heapq.heappush(queue, (next_distance, neighbor))
@@ -1002,6 +1127,8 @@ def shortest_path(
         path_edges.append(edge)
         cursor = prev_node
     path_edges.reverse()
+
+    logger.info(f"Found path with {len(path_edges)} edges, total length: {distances[end]:.6f} mm")
     return distances[end], path_edges
 
 
@@ -1012,17 +1139,34 @@ def has_alternative_path(
     end: int,
     chosen_edge_ids: set[int],
 ) -> bool:
+    """Check if alternative paths exist between start and end nodes.
+
+    This function determines if there are multiple distinct paths by checking
+    if any single weighted edge in the chosen path can be removed while still
+    maintaining connectivity.
+
+    Args:
+        node_count: Total number of nodes in the graph
+        edges: All edges in the graph
+        start: Starting node ID
+        end: Ending node ID
+        chosen_edge_ids: Set of edge IDs in the chosen path
+
+    Returns:
+        True if alternative paths exist, False otherwise
+    """
     disjoint_set = DisjointSet()
     for node in range(node_count):
         disjoint_set.add(node)
     for edge in edges:
-        if edge.track_mm == 0.0 and edge.via_mm == 0.0:
+        # Zero-cost edges (pads, pass-throughs) don't contribute to path alternatives
+        if is_zero(edge.track_mm) and is_zero(edge.via_mm):
             disjoint_set.union(edge.a, edge.b)
 
     reduced_adjacency: dict[int, list[tuple[int, int]]] = defaultdict(list)
     reduced_edges: dict[int, tuple[int, int]] = {}
     for edge in edges:
-        if edge.track_mm == 0.0 and edge.via_mm == 0.0:
+        if is_zero(edge.track_mm) and is_zero(edge.via_mm):
             continue
         left = disjoint_set.find(edge.a)
         right = disjoint_set.find(edge.b)
@@ -1106,7 +1250,7 @@ def measure(
     else:
         total_cost_mm, path_edges = shortest_path(adjacency, endpoint_nodes["start"], endpoint_nodes["end"])
 
-    chosen_weighted_edge_ids = {edge.edge_id for edge in path_edges if (edge.track_mm > 0.0 or edge.via_mm > 0.0)}
+    chosen_weighted_edge_ids = {edge.edge_id for edge in path_edges if (not is_zero(edge.track_mm) or not is_zero(edge.via_mm))}
     if not allow_alternative_paths and has_alternative_path(
         node_count=len(reverse_nodes),
         edges=edges,
@@ -1232,11 +1376,11 @@ def shorten_cell(value: str, max_width: int) -> str:
 
 
 def format_bridge_cell(result: dict[str, object]) -> str:
-    pass_through_refs = list(result.get("pass_through_refs", []))
+    pass_through_refs = list(result.get("pass_through_refs", []))  # type: ignore[call-overload]
     if not pass_through_refs:
         return "(none)"
 
-    auto_refs = set(result.get("auto_pass_through_refs", []))
+    auto_refs = set(result.get("auto_pass_through_refs", []))  # type: ignore[call-overload]
     return ", ".join(
         f"{ref} (auto)" if ref in auto_refs else ref
         for ref in pass_through_refs
@@ -1263,7 +1407,7 @@ def render_table(headers: list[str], rows: list[list[str]]) -> str:
 
 def summarize_results(results: list[dict[str, object]]) -> dict[str, float | int | None]:
     successful_totals = [
-        float(result["total_length_mm"])
+        float(result["total_length_mm"])  # type: ignore[arg-type]
         for result in results
         if result.get("status") == "OK" and result.get("total_length_mm") is not None
     ]
@@ -1306,17 +1450,17 @@ def render_results_table(results: list[dict[str, object]], include_via_length: b
     for result in results:
         delta_mm = None
         if result.get("status") == "OK" and result.get("total_length_mm") is not None and min_total_mm is not None:
-            delta_mm = float(result["total_length_mm"]) - float(min_total_mm)
+            delta_mm = float(result["total_length_mm"]) - float(min_total_mm)  # type: ignore[arg-type]
         rows.append(
             [
                 shorten_cell(str(result["source_net"] or ""), 24),
                 shorten_cell(str(result["destination_net"] or ""), 24),
                 shorten_cell(str(result["start_pad"]), 12),
                 shorten_cell(str(result["end_pad"]), 12),
-                format_length_cell(result["track_length_mm"]),
-                format_length_cell(result["via_length_mm"]),
-                format_length_cell(result["total_length_mm"]),
-                format_length_cell(delta_mm),
+                format_length_cell(result["track_length_mm"]),  # type: ignore[arg-type]
+                format_length_cell(result["via_length_mm"]),  # type: ignore[arg-type]
+                format_length_cell(result["total_length_mm"]),  # type: ignore[arg-type]
+                format_length_cell(delta_mm),  # type: ignore[arg-type]
                 shorten_cell(format_bridge_cell(result), 24),
                 str(result.get("status", "OK")),
             ]
@@ -1365,9 +1509,9 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Matched summary: "
             f"OK={summary['successful_count']}, "
-            f"Min total={format_length(summary['min_total_mm'])}, "
-            f"Max total={format_length(summary['max_total_mm'])}, "
-            f"Max diff={format_length(summary['max_diff_mm'])}"
+            f"Min total={format_length(summary['min_total_mm'])}, "  # type: ignore[arg-type]
+            f"Max total={format_length(summary['max_total_mm'])}, "  # type: ignore[arg-type]
+            f"Max diff={format_length(summary['max_diff_mm'])}"  # type: ignore[arg-type]
         )
 
     error_results = [result for result in results if result.get("status") == "ERROR"]
@@ -1382,9 +1526,9 @@ def main(argv: list[str] | None = None) -> int:
             if index or results:
                 print()
             print(f"Detailed path: {result['start_pad']} -> {result['end_pad']}")
-            print("Nets visited: " + (", ".join(result["nets_visited"]) if result["nets_visited"] else "(none)"))
+            print("Nets visited: " + (", ".join(result["nets_visited"]) if result["nets_visited"] else "(none)"))  # type: ignore[arg-type]
             print("Path breakdown:")
-            for edge in result["path_edges"]:
+            for edge in result["path_edges"]:  # type: ignore[attr-defined]
                 if edge.kind == "pad":
                     label = f"pad attach {edge.detail}"
                 elif edge.kind == "pass_through":

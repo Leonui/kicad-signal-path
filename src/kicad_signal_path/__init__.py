@@ -13,6 +13,8 @@ from .core import (
     resolve_regex_measurements,
     summarize_results,
 )
+from .types import MeasurementResult, SummaryMetrics
+from .validation import ValidationError, ResourceLimitError, TimeoutError
 
 __all__ = [
     "BoardParseError",
@@ -24,6 +26,11 @@ __all__ = [
     "render_results_table",
     "resolve_regex_measurements",
     "summarize_results",
+    "MeasurementResult",
+    "SummaryMetrics",
+    "ValidationError",
+    "ResourceLimitError",
+    "TimeoutError",
 ]
 
 try:
