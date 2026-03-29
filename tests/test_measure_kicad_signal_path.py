@@ -13,7 +13,7 @@ if str(SRC) not in sys.path:
 if str(TESTS) not in sys.path:
     sys.path.insert(0, str(TESTS))
 
-from board_factory import VIA_LENGTH_MM, write_sample_board, write_single_bridge_board
+from board_factory import VIA_LENGTH_MM, write_off_center_via_board, write_sample_board, write_single_bridge_board
 from kicad_signal_path import (
     load_board,
     measure,
@@ -36,15 +36,22 @@ class MeasureKicadSignalPathTests(unittest.TestCase):
             include_unrelated_fmc_axis_i_a_via=True,
         )
         cls.ambiguous_board_path = write_sample_board(base / "ambiguous_board.kicad_pcb", include_axis_i_a_probe=True)
+        cls.branch_bridge_board_path = write_sample_board(
+            base / "branch_bridge_board.kicad_pcb",
+            include_fmc_axis_i_a_branch_bridge=True,
+        )
         cls.name_only_board_path = write_sample_board(base / "name_only_board.kicad_pcb", net_format="name_only")
         cls.cap_bridge_board_path = write_single_bridge_board(base / "cap_bridge_board.kicad_pcb", bridge_ref="C1")
+        cls.off_center_via_board_path = write_off_center_via_board(base / "off_center_via_board.kicad_pcb")
 
         cls.board = load_board(cls.board_path)
         cls.board_without_stackup = load_board(cls.missing_stackup_path)
         cls.board_without_stackup_unrelated_via = load_board(cls.missing_stackup_unrelated_via_path)
         cls.ambiguous_board = load_board(cls.ambiguous_board_path)
+        cls.branch_bridge_board = load_board(cls.branch_bridge_board_path)
         cls.name_only_board = load_board(cls.name_only_board_path)
         cls.cap_bridge_board = load_board(cls.cap_bridge_board_path)
+        cls.off_center_via_board = load_board(cls.off_center_via_board_path)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -120,6 +127,20 @@ class MeasureKicadSignalPathTests(unittest.TestCase):
         self.assertAlmostEqual(result["via_length_mm"], VIA_LENGTH_MM, places=6)
         self.assertAlmostEqual(result["total_length_mm"], 20.000000 + VIA_LENGTH_MM, places=6)
 
+    def test_single_path_connects_through_off_center_via_attachment(self) -> None:
+        result = measure(
+            board=self.off_center_via_board,
+            start_selector="U1:1",
+            end_selector="J1:1",
+            allowed_pass_through_refs=set(),
+            include_via_length=True,
+            allow_alternative_paths=False,
+        )
+        self.assertEqual(result["status"], "OK")
+        self.assertAlmostEqual(result["track_length_mm"], 30.401923, places=6)
+        self.assertAlmostEqual(result["via_length_mm"], VIA_LENGTH_MM, places=6)
+        self.assertAlmostEqual(result["total_length_mm"], 30.401923 + VIA_LENGTH_MM, places=6)
+
     def test_regex_pair_mode_matches_input_lanes(self) -> None:
         results = resolve_regex_measurements(
             board=self.board,
@@ -135,6 +156,22 @@ class MeasureKicadSignalPathTests(unittest.TestCase):
         self.assertEqual(result_map["/AXIS_I_B"]["pass_through_refs"], ["R2"])
         self.assertEqual(result_map["/AXIS_I_A"]["auto_pass_through_refs"], ["R1"])
         self.assertEqual(result_map["/AXIS_I_B"]["auto_pass_through_refs"], ["R2"])
+
+    def test_regex_pair_mode_normalizes_destination_net_and_prefers_non_bridge_endpoint(self) -> None:
+        results = resolve_regex_measurements(
+            board=self.branch_bridge_board,
+            src_net_regex="^/AXIS_I_A$",
+            dst_net_template="FMC_AXIS_I_A",
+            explicit_pass_through_refs=set(),
+            include_via_length=True,
+            allow_alternative_paths=False,
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "OK")
+        self.assertEqual(results[0]["destination_net"], "/FMC_AXIS_I_A")
+        self.assertEqual(results[0]["start_pad"], "U1:1")
+        self.assertEqual(results[0]["end_pad"], "J1:1")
+        self.assertEqual(results[0]["pass_through_refs"], ["R1"])
 
     def test_regex_pair_mode_can_auto_find_resistor_pass_throughs(self) -> None:
         results = resolve_regex_measurements(

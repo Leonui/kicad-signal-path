@@ -16,6 +16,7 @@ NET_ORDINALS = {
     "/FMC_AXIS_I_B": 4,
     "/FMC_AXIS_O_DATA": 5,
     "/AXIS_O_DATA": 6,
+    "/FMC_AXIS_I_A_LB": 7,
 }
 
 LAYER_ORDINALS = {
@@ -126,11 +127,19 @@ def _segment(net: str, layer: str, start: tuple[float, float], end: tuple[float,
     )
 
 
-def _via(net: str, at: tuple[float, float], layers: tuple[str, ...], *, net_format: str) -> str:
+def _via(
+    net: str,
+    at: tuple[float, float],
+    layers: tuple[str, ...],
+    *,
+    net_format: str,
+    size: float = 0.6,
+) -> str:
     layer_values = " ".join(_quoted(layer) for layer in layers)
     return (
         f"  (via\n"
         f"    (at {at[0]:.3f} {at[1]:.3f})\n"
+        f"    (size {size:.3f})\n"
         f"    (layers {layer_values})\n"
         f"    (net {_route_net_attr(net, net_format)}))"
     )
@@ -141,6 +150,7 @@ def build_sample_board(
     include_stackup: bool = True,
     include_axis_i_a_probe: bool = False,
     include_unrelated_fmc_axis_i_a_via: bool = False,
+    include_fmc_axis_i_a_branch_bridge: bool = False,
     net_format: str = "ordinal",
 ) -> str:
     if net_format not in {"ordinal", "name_only"}:
@@ -256,6 +266,20 @@ def build_sample_board(
             )
         )
 
+    if include_fmc_axis_i_a_branch_bridge:
+        parts.append(
+            _footprint(
+                "R4",
+                "r4-uuid",
+                25.0,
+                5.0,
+                [
+                    _pad("1", "smd", "rect", net_format, at=(-5.0, 0.0, 0.0), layers=(F_CU,), net="/FMC_AXIS_I_A"),
+                    _pad("2", "smd", "rect", net_format, at=(5.0, 0.0, 0.0), layers=(F_CU,), net="/FMC_AXIS_I_A_LB"),
+                ],
+            )
+        )
+
     if include_unrelated_fmc_axis_i_a_via:
         parts.append(_via("/FMC_AXIS_I_A", (24.000, 4.000), (F_CU, B_CU), net_format=net_format))
 
@@ -281,6 +305,7 @@ def write_sample_board(
     include_stackup: bool = True,
     include_axis_i_a_probe: bool = False,
     include_unrelated_fmc_axis_i_a_via: bool = False,
+    include_fmc_axis_i_a_branch_bridge: bool = False,
     net_format: str = "ordinal",
 ) -> Path:
     path.write_text(
@@ -288,6 +313,7 @@ def write_sample_board(
             include_stackup=include_stackup,
             include_axis_i_a_probe=include_axis_i_a_probe,
             include_unrelated_fmc_axis_i_a_via=include_unrelated_fmc_axis_i_a_via,
+            include_fmc_axis_i_a_branch_bridge=include_fmc_axis_i_a_branch_bridge,
             net_format=net_format,
         ),
         encoding="utf-8",
@@ -393,5 +419,85 @@ def write_single_bridge_board(
             ")",
         ]
     )
+    path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    return path
+
+
+def write_off_center_via_board(path: Path, *, net_format: str = "name_only") -> Path:
+    if net_format not in {"ordinal", "name_only"}:
+        raise ValueError(f"unsupported net format '{net_format}'")
+
+    local_net_ordinals = {"": 0, "/N": 1}
+
+    def local_net_attr(net: str) -> str:
+        if net_format == "name_only":
+            return _net_name(net)
+        return f'{local_net_ordinals[net]} {_net_name(net)}'
+
+    def local_route_net_attr(net: str) -> str:
+        if net_format == "name_only":
+            return _net_name(net)
+        return str(local_net_ordinals[net])
+
+    parts = [
+        "(kicad_pcb",
+        _board_layers(),
+        _stackup(),
+    ]
+    if net_format == "ordinal":
+        parts.extend(
+            [
+                "  (net 0 \"\")",
+                "  (net 1 \"/N\")",
+            ]
+        )
+
+    parts.extend(
+        [
+            _footprint(
+                "U1",
+                "u1-uuid",
+                0.0,
+                0.0,
+                [
+                    '    (pad "1" thru_hole circle\n'
+                    '      (at 0.000 0.000 0.000)\n'
+                    '      (size 2.000 2.000)\n'
+                    f'      (layers "{ALL_CU}")\n'
+                    f"      (net {local_net_attr('/N')}))",
+                ],
+            ),
+            _footprint(
+                "J1",
+                "j1-uuid",
+                30.0,
+                0.0,
+                [
+                    '    (pad "1" thru_hole circle\n'
+                    '      (at 0.000 0.000 0.000)\n'
+                    '      (size 2.000 2.000)\n'
+                    f'      (layers "{ALL_CU}")\n'
+                    f"      (net {local_net_attr('/N')}))",
+                ],
+            ),
+            (
+                "  (segment\n"
+                "    (start 0.000 0.000)\n"
+                "    (end 20.000 0.000)\n"
+                f'    (layer "{F_CU}")\n'
+                f"    (net {local_route_net_attr('/N')}))"
+            ),
+            _via("/N", (20.0, 0.0), (F_CU, B_CU), net_format=net_format, size=1.0),
+            (
+                "  (segment\n"
+                "    (start 19.600 0.200)\n"
+                "    (end 30.000 0.000)\n"
+                f'    (layer "{B_CU}")\n'
+                f"    (net {local_route_net_attr('/N')}))"
+            ),
+            ")",
+        ]
+    )
+
     path.write_text("\n".join(parts) + "\n", encoding="utf-8")
     return path

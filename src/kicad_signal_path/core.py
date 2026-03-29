@@ -349,6 +349,11 @@ class Via:
     net: str
     at_mm: tuple[float, float]
     layers: tuple[str, ...]
+    size_mm: float
+
+    def contains_point(self, point_mm: tuple[float, float], tolerance_mm: float = PAD_TOLERANCE_MM) -> bool:
+        radius = max(self.size_mm / 2.0, 0.0) + tolerance_mm
+        return distance(self.at_mm, point_mm) <= radius
 
 
 @dataclass(frozen=True)
@@ -554,7 +559,8 @@ def parse_vias(root: SExp, nets_by_ordinal: dict[str, str]) -> tuple[Via, ...]:
             continue
         at = (float_atom(at_node, 1, 0.0) or 0.0, float_atom(at_node, 2, 0.0) or 0.0)
         layers = tuple(value for value in layers_node[1:] if isinstance(value, str))
-        result.append(Via(net=net, at_mm=at, layers=layers))
+        size_mm = float_atom(first_child(node, "size"), 1, 0.0) or 0.0
+        result.append(Via(net=net, at_mm=at, layers=layers, size_mm=size_mm))
     return tuple(result)
 
 
@@ -699,9 +705,38 @@ def expand_dst_template(template: str, match: re.Match[str], board_nets: set[str
     value = template
     value = re.sub(r"\(\$(\d+)\)", lambda token: match.group(int(token.group(1))) or "", value)
     value = re.sub(r"\$(\d+)", lambda token: match.group(int(token.group(1))) or "", value)
-    if value not in board_nets and value.endswith("/") and value[:-1] in board_nets:
-        value = value[:-1]
-    return value
+    return normalize_net_name(value, board_nets)
+
+
+def normalize_net_name(net_name: str, board_nets: set[str]) -> str:
+    if net_name in board_nets:
+        return net_name
+
+    candidates = unique_sequence(
+        [
+            net_name[:-1] if net_name.endswith("/") else None,
+            f"/{net_name}" if net_name and not net_name.startswith("/") else None,
+            net_name[1:] if net_name.startswith("/") else None,
+        ]
+    )
+    for candidate in candidates:
+        if candidate in board_nets:
+            return candidate
+    return net_name
+
+
+def is_auto_pass_through_ref(ref: str | None) -> bool:
+    return ref is not None and any(fnmatchcase(ref, pattern) for pattern in AUTO_PASS_THROUGH_REF_GLOBS)
+
+
+def auto_pass_through_footprints(board: BoardModel) -> set[str]:
+    pads_by_footprint = group_pads_by_footprint(board)
+    ref_by_uuid, _ = build_footprint_ref_maps(board)
+    return {
+        footprint_uuid
+        for footprint_uuid, pads in pads_by_footprint.items()
+        if len(pads) == 2 and is_auto_pass_through_ref(ref_by_uuid.get(footprint_uuid))
+    }
 
 
 def find_bridge_footprints(board: BoardModel, left_net: str, right_net: str) -> set[str]:
@@ -712,7 +747,7 @@ def find_bridge_footprints(board: BoardModel, left_net: str, right_net: str) -> 
         if len(pads) != 2:
             continue
         ref = ref_by_uuid.get(footprint_uuid)
-        if ref is None or not any(fnmatchcase(ref, pattern) for pattern in AUTO_PASS_THROUGH_REF_GLOBS):
+        if not is_auto_pass_through_ref(ref):
             continue
         pad_nets = {pad.net for pad in pads if pad.net}
         if pad_nets == {left_net, right_net}:
@@ -792,7 +827,13 @@ def resolve_pass_through_footprints(board: BoardModel, selectors: set[str]) -> s
     return resolved
 
 
-def resolve_unique_pad_for_net(board: BoardModel, net_name: str, excluded_footprints: set[str]) -> Pad:
+def resolve_unique_pad_for_net(
+    board: BoardModel,
+    net_name: str,
+    excluded_footprints: set[str],
+    *,
+    prefer_non_bridge: bool = False,
+) -> Pad:
     ref_by_uuid, uuids_by_ref = build_footprint_ref_maps(board)
     candidates = [pad for pad in board.pads if pad.net == net_name and pad.footprint_uuid not in excluded_footprints]
     if not candidates:
@@ -801,9 +842,22 @@ def resolve_unique_pad_for_net(board: BoardModel, net_name: str, excluded_footpr
             labels = sorted(footprint_display_name(footprint_uuid, ref_by_uuid, uuids_by_ref) for footprint_uuid in excluded_footprints)
             excluded = f" after excluding {labels}"
         raise ValueError(f"no pad found on net '{net_name}'{excluded}")
+    if len(candidates) > 1 and prefer_non_bridge:
+        bridge_footprints = auto_pass_through_footprints(board)
+        preferred_candidates = [pad for pad in candidates if pad.footprint_uuid not in bridge_footprints]
+        if len(preferred_candidates) == 1:
+            return preferred_candidates[0]
     if len(candidates) > 1:
         candidate_names = ", ".join(sorted(pad_display_name(pad, ref_by_uuid, uuids_by_ref) for pad in candidates))
-        raise ValueError(f"net '{net_name}' resolved to multiple possible endpoint pads: {candidate_names}")
+        bridge_refs = unique_sequence(
+            ref_by_uuid.get(pad.footprint_uuid)
+            for pad in candidates
+            if pad.footprint_uuid in auto_pass_through_footprints(board)
+        )
+        suggestion = ""
+        if bridge_refs:
+            suggestion = f"; try excluding bridge refs {', '.join(bridge_refs)} with --pass-through or use --start/--end"
+        raise ValueError(f"net '{net_name}' resolved to multiple possible endpoint pads: {candidate_names}{suggestion}")
     return candidates[0]
 
 
@@ -850,8 +904,18 @@ def resolve_regex_measurements(
         auto_pass_through_labels = labels_for_footprints(board, auto_pass_through_footprints)
 
         try:
-            start_pad = resolve_unique_pad_for_net(board, source_net, pass_through_footprints)
-            end_pad = resolve_unique_pad_for_net(board, destination_net, pass_through_footprints)
+            start_pad = resolve_unique_pad_for_net(
+                board,
+                source_net,
+                pass_through_footprints,
+                prefer_non_bridge=True,
+            )
+            end_pad = resolve_unique_pad_for_net(
+                board,
+                destination_net,
+                pass_through_footprints,
+                prefer_non_bridge=True,
+            )
             result = measure(
                 board=board,
                 start_selector=pad_display_name(start_pad, ref_by_uuid, uuids_by_ref),
@@ -868,12 +932,22 @@ def resolve_regex_measurements(
             start_label = "(unresolved)"
             end_label = "(unresolved)"
             try:
-                start_pad = resolve_unique_pad_for_net(board, source_net, pass_through_footprints)
+                start_pad = resolve_unique_pad_for_net(
+                    board,
+                    source_net,
+                    pass_through_footprints,
+                    prefer_non_bridge=True,
+                )
                 start_label = pad_display_name(start_pad, ref_by_uuid, uuids_by_ref)
             except ValueError:
                 pass
             try:
-                end_pad = resolve_unique_pad_for_net(board, destination_net, pass_through_footprints)
+                end_pad = resolve_unique_pad_for_net(
+                    board,
+                    destination_net,
+                    pass_through_footprints,
+                    prefer_non_bridge=True,
+                )
                 end_label = pad_display_name(end_pad, ref_by_uuid, uuids_by_ref)
             except ValueError:
                 pass
@@ -974,6 +1048,8 @@ def build_graph(
             detail=None,
         )
 
+    via_nodes_by_layer: list[tuple[Via, str, int]] = []
+
     for via in board.vias:
         copper_span = board.stackup.copper_span(via.layers[0], via.layers[-1])
         via_nodes: list[int] = []
@@ -982,6 +1058,7 @@ def build_graph(
             point_node_nets[node].add(via.net)
             point_nodes_by_layer[layer].add(node)
             via_nodes.append(node)
+            via_nodes_by_layer.append((via, layer, node))
         for left_layer, right_layer, left_node, right_node in zip(copper_span, copper_span[1:], via_nodes, via_nodes[1:]):
             raw_via_mm = 0.0
             if board.stackup.has_via_height_data:
@@ -997,6 +1074,27 @@ def build_graph(
                 layer=f"{left_layer}->{right_layer}",
                 detail=None,
             )
+
+    for via, layer, via_node in via_nodes_by_layer:
+        for point_node in point_nodes_by_layer.get(layer, set()):
+            if point_node == via_node:
+                continue
+            if via.net not in point_node_nets[point_node]:
+                continue
+            point_key = reverse_nodes[point_node]
+            point = (float(point_key[2]), float(point_key[3]))  # type: ignore[arg-type]
+            if via.contains_point(point):
+                add_edge(
+                    via_node,
+                    point_node,
+                    cost_mm=0.0,
+                    track_mm=0.0,
+                    via_mm=0.0,
+                    kind="via_attach",
+                    net=via.net,
+                    layer=layer,
+                    detail=None,
+                )
 
     pad_anchor_nodes: dict[tuple[str, str], int] = {}
     for pad in board.pads:
