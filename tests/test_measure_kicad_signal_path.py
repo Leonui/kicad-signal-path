@@ -13,9 +13,17 @@ if str(SRC) not in sys.path:
 if str(TESTS) not in sys.path:
     sys.path.insert(0, str(TESTS))
 
-from board_factory import VIA_LENGTH_MM, write_off_center_via_board, write_sample_board, write_single_bridge_board
+from board_factory import (
+    VIA_LENGTH_MM,
+    write_multi_segment_match_board,
+    write_off_center_via_board,
+    write_prefer_existing_snake_board,
+    write_sample_board,
+    write_single_bridge_board,
+)
 from kicad_signal_path import (
     load_board,
+    match_regex_measurements,
     measure,
     render_results_table,
     resolve_regex_measurements,
@@ -43,6 +51,8 @@ class MeasureKicadSignalPathTests(unittest.TestCase):
         cls.name_only_board_path = write_sample_board(base / "name_only_board.kicad_pcb", net_format="name_only")
         cls.cap_bridge_board_path = write_single_bridge_board(base / "cap_bridge_board.kicad_pcb", bridge_ref="C1")
         cls.off_center_via_board_path = write_off_center_via_board(base / "off_center_via_board.kicad_pcb")
+        cls.multi_segment_match_board_path = write_multi_segment_match_board(base / "multi_segment_match_board.kicad_pcb")
+        cls.prefer_existing_snake_board_path = write_prefer_existing_snake_board(base / "prefer_existing_snake_board.kicad_pcb")
 
         cls.board = load_board(cls.board_path)
         cls.board_without_stackup = load_board(cls.missing_stackup_path)
@@ -52,6 +62,8 @@ class MeasureKicadSignalPathTests(unittest.TestCase):
         cls.name_only_board = load_board(cls.name_only_board_path)
         cls.cap_bridge_board = load_board(cls.cap_bridge_board_path)
         cls.off_center_via_board = load_board(cls.off_center_via_board_path)
+        cls.multi_segment_match_board = load_board(cls.multi_segment_match_board_path)
+        cls.prefer_existing_snake_board = load_board(cls.prefer_existing_snake_board_path)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -251,6 +263,128 @@ class MeasureKicadSignalPathTests(unittest.TestCase):
         self.assertAlmostEqual(summary["min_total_mm"], 20.000000, places=6)
         self.assertAlmostEqual(summary["max_total_mm"], 20.000000 + VIA_LENGTH_MM, places=6)
         self.assertAlmostEqual(summary["max_diff_mm"], VIA_LENGTH_MM, places=6)
+
+    def test_match_regex_measurements_writes_length_matched_board(self) -> None:
+        output_path = Path(self.temp_dir.name) / "matched_board.kicad_pcb"
+        destination, results, changes = match_regex_measurements(
+            board_path=self.board_path,
+            src_net_regex="/AXIS_I_(.*)/",
+            dst_net_template="/FMC_AXIS_I_($1)/",
+            explicit_pass_through_refs=set(),
+            include_via_length=True,
+            allow_alternative_paths=False,
+            tolerance_mm=1e-6,
+            output_path=output_path,
+        )
+
+        self.assertEqual(destination, output_path)
+        self.assertTrue(output_path.exists())
+        self.assertEqual(len(changes), 1)
+
+        matched_summary = summarize_results(results)
+        self.assertAlmostEqual(matched_summary["max_diff_mm"], 0.0, places=6)
+
+        result_map = {result["source_net"]: result for result in results}
+        self.assertAlmostEqual(
+            result_map["/AXIS_I_A"]["total_length_mm"],
+            result_map["/AXIS_I_B"]["total_length_mm"],
+            places=6,
+        )
+        self.assertGreater(result_map["/AXIS_I_A"]["track_length_mm"], 20.000000)
+
+        original_results = resolve_regex_measurements(
+            board=self.board,
+            src_net_regex="/AXIS_I_(.*)/",
+            dst_net_template="/FMC_AXIS_I_($1)/",
+            explicit_pass_through_refs=set(),
+            include_via_length=True,
+            allow_alternative_paths=False,
+        )
+        original_summary = summarize_results(original_results)
+        self.assertAlmostEqual(original_summary["max_diff_mm"], VIA_LENGTH_MM, places=6)
+
+        matched_board = load_board(output_path)
+        self.assertIn("(arc", output_path.read_text(encoding="utf-8"))
+        matched_board_results = resolve_regex_measurements(
+            board=matched_board,
+            src_net_regex="/AXIS_I_(.*)/",
+            dst_net_template="/FMC_AXIS_I_($1)/",
+            explicit_pass_through_refs=set(),
+            include_via_length=True,
+            allow_alternative_paths=False,
+        )
+        reparsed_summary = summarize_results(matched_board_results)
+        self.assertAlmostEqual(reparsed_summary["max_diff_mm"], 0.0, places=6)
+
+    def test_match_regex_measurements_can_use_multi_segment_route_window(self) -> None:
+        output_path = Path(self.temp_dir.name) / "multi_segment_matched_board.kicad_pcb"
+
+        original_results = resolve_regex_measurements(
+            board=self.multi_segment_match_board,
+            src_net_regex="/BUS_(.*)/",
+            dst_net_template="/DST_($1)/",
+            explicit_pass_through_refs=set(),
+            include_via_length=True,
+            allow_alternative_paths=False,
+        )
+        original_summary = summarize_results(original_results)
+        self.assertAlmostEqual(original_summary["max_diff_mm"], 0.4, places=6)
+
+        destination, results, changes = match_regex_measurements(
+            board_path=self.multi_segment_match_board_path,
+            src_net_regex="/BUS_(.*)/",
+            dst_net_template="/DST_($1)/",
+            explicit_pass_through_refs=set(),
+            include_via_length=True,
+            allow_alternative_paths=False,
+            tolerance_mm=1e-6,
+            output_path=output_path,
+        )
+
+        self.assertEqual(destination, output_path)
+        self.assertEqual(len(changes), 1)
+        matched_summary = summarize_results(results)
+        self.assertLess(float(matched_summary["max_diff_mm"]), 5e-6)
+
+        result_map = {result["source_net"]: result for result in results}
+        self.assertGreater(result_map["/BUS_A"]["track_length_mm"], 7.2)
+        self.assertLess(abs(float(result_map["/BUS_A"]["total_length_mm"]) - float(result_map["/BUS_B"]["total_length_mm"])), 5e-6)
+        self.assertIn("(arc", output_path.read_text(encoding="utf-8"))
+
+    def test_match_regex_measurements_prefers_existing_snake_before_new_detour(self) -> None:
+        output_path = Path(self.temp_dir.name) / "prefer_existing_snake_matched_board.kicad_pcb"
+
+        original_results = resolve_regex_measurements(
+            board=self.prefer_existing_snake_board,
+            src_net_regex="/SNAKE_([AB])/",
+            dst_net_template="/SNAKE_DST_($1)/",
+            explicit_pass_through_refs=set(),
+            include_via_length=True,
+            allow_alternative_paths=False,
+        )
+        original_summary = summarize_results(original_results)
+        self.assertAlmostEqual(original_summary["min_total_mm"], 12.0, places=6)
+        self.assertAlmostEqual(original_summary["max_total_mm"], 13.0, places=6)
+
+        destination, results, changes = match_regex_measurements(
+            board_path=self.prefer_existing_snake_board_path,
+            src_net_regex="/SNAKE_([AB])/",
+            dst_net_template="/SNAKE_DST_($1)/",
+            explicit_pass_through_refs=set(),
+            include_via_length=True,
+            allow_alternative_paths=False,
+            tolerance_mm=1e-6,
+            output_path=output_path,
+        )
+
+        self.assertEqual(destination, output_path)
+        self.assertEqual(len(changes), 1)
+        matched_summary = summarize_results(results)
+        self.assertLess(float(matched_summary["max_diff_mm"]), 5e-6)
+
+        output_text = output_path.read_text(encoding="utf-8")
+        self.assertIn('(start 0.000 10.000)\n    (end 3.000 10.000)', output_text)
+        self.assertIn('(start 5.000000 9.763763)\n    (end 5.000000 11.236237)', output_text)
 
     def test_missing_stackup_still_loads_and_allows_via_free_paths(self) -> None:
         self.assertFalse(self.board_without_stackup.stackup.has_via_height_data)

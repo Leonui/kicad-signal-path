@@ -501,3 +501,284 @@ def write_off_center_via_board(path: Path, *, net_format: str = "name_only") -> 
 
     path.write_text("\n".join(parts) + "\n", encoding="utf-8")
     return path
+
+
+def write_multi_segment_match_board(path: Path, *, net_format: str = "name_only") -> Path:
+    if net_format not in {"ordinal", "name_only"}:
+        raise ValueError(f"unsupported net format '{net_format}'")
+
+    local_net_ordinals = {
+        "": 0,
+        "/BUS_A": 1,
+        "/DST_A": 2,
+        "/BUS_B": 3,
+        "/DST_B": 4,
+    }
+
+    def local_net_attr(net: str) -> str:
+        if net_format == "name_only":
+            return _net_name(net)
+        return f'{local_net_ordinals[net]} {_net_name(net)}'
+
+    def local_route_net_attr(net: str) -> str:
+        if net_format == "name_only":
+            return _net_name(net)
+        return str(local_net_ordinals[net])
+
+    def local_segment(net: str, start_x: float, end_x: float, y: float) -> str:
+        return (
+            "  (segment\n"
+            f"    (start {start_x:.3f} {y:.3f})\n"
+            f"    (end {end_x:.3f} {y:.3f})\n"
+            f'    (layer "{F_CU}")\n'
+            f"    (net {local_route_net_attr(net)}))"
+        )
+
+    def segment_chain(net: str, start_x: float, y: float, lengths: list[float]) -> list[str]:
+        segments: list[str] = []
+        cursor_x = start_x
+        for length in lengths:
+            next_x = cursor_x + length
+            segments.append(local_segment(net, cursor_x, next_x, y))
+            cursor_x = next_x
+        return segments
+
+    parts = [
+        "(kicad_pcb",
+        _board_layers(),
+        _stackup(),
+    ]
+    if net_format == "ordinal":
+        parts.extend(
+            [
+                "  (net 0 \"\")",
+                "  (net 1 \"/BUS_A\")",
+                "  (net 2 \"/DST_A\")",
+                "  (net 3 \"/BUS_B\")",
+                "  (net 4 \"/DST_B\")",
+            ]
+        )
+
+    parts.extend(
+        [
+            _footprint(
+                "U1",
+                "u1-uuid",
+                0.0,
+                0.0,
+                [
+                    _pad(
+                        "1",
+                        "thru_hole",
+                        "circle",
+                        net_format,
+                        layers=(ALL_CU,),
+                        net="/BUS_A",
+                        size=(0.4, 0.4),
+                    ),
+                ],
+            ),
+            _footprint(
+                "J1",
+                "j1-uuid",
+                8.2,
+                0.0,
+                [
+                    _pad(
+                        "1",
+                        "thru_hole",
+                        "circle",
+                        net_format,
+                        layers=(ALL_CU,),
+                        net="/DST_A",
+                        size=(0.4, 0.4),
+                    ),
+                ],
+            ),
+            _footprint(
+                "R1",
+                "r1-uuid",
+                4.1,
+                0.0,
+                [
+                    _pad("1", "smd", "rect", net_format, at=(-0.5, 0.0, 0.0), layers=(F_CU,), net="/BUS_A", size=(0.4, 0.4)),
+                    _pad("2", "smd", "rect", net_format, at=(0.5, 0.0, 0.0), layers=(F_CU,), net="/DST_A", size=(0.4, 0.4)),
+                ],
+            ),
+            _footprint(
+                "U2",
+                "u2-uuid",
+                0.0,
+                10.0,
+                [
+                    _pad(
+                        "1",
+                        "thru_hole",
+                        "circle",
+                        net_format,
+                        layers=(ALL_CU,),
+                        net="/BUS_B",
+                        size=(0.4, 0.4),
+                    ),
+                ],
+            ),
+            _footprint(
+                "J2",
+                "j2-uuid",
+                8.6,
+                10.0,
+                [
+                    _pad(
+                        "1",
+                        "thru_hole",
+                        "circle",
+                        net_format,
+                        layers=(ALL_CU,),
+                        net="/DST_B",
+                        size=(0.4, 0.4),
+                    ),
+                ],
+            ),
+            _footprint(
+                "R2",
+                "r2-uuid",
+                4.5,
+                10.0,
+                [
+                    _pad("1", "smd", "rect", net_format, at=(-0.5, 0.0, 0.0), layers=(F_CU,), net="/BUS_B", size=(0.4, 0.4)),
+                    _pad("2", "smd", "rect", net_format, at=(0.5, 0.0, 0.0), layers=(F_CU,), net="/DST_B", size=(0.4, 0.4)),
+                ],
+            ),
+        ]
+    )
+
+    parts.extend(segment_chain("/BUS_A", 0.0, 0.0, [0.6, 0.6, 0.6, 0.6, 0.6, 0.6]))
+    parts.extend(segment_chain("/DST_A", 4.6, 0.0, [0.6, 0.6, 0.6, 0.6, 0.6, 0.6]))
+    parts.extend(segment_chain("/BUS_B", 0.0, 10.0, [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.4]))
+    parts.extend(segment_chain("/DST_B", 5.0, 10.0, [0.6, 0.6, 0.6, 0.6, 0.6, 0.6]))
+    parts.append(")")
+
+    path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    return path
+
+
+def write_prefer_existing_snake_board(path: Path, *, net_format: str = "name_only") -> Path:
+    if net_format not in {"ordinal", "name_only"}:
+        raise ValueError(f"unsupported net format '{net_format}'")
+
+    local_net_ordinals = {
+        "": 0,
+        "/SNAKE_A": 1,
+        "/SNAKE_DST_A": 2,
+        "/SNAKE_B": 3,
+        "/SNAKE_DST_B": 4,
+    }
+
+    def local_net_attr(net: str) -> str:
+        if net_format == "name_only":
+            return _net_name(net)
+        return f'{local_net_ordinals[net]} {_net_name(net)}'
+
+    def local_route_net_attr(net: str) -> str:
+        if net_format == "name_only":
+            return _net_name(net)
+        return str(local_net_ordinals[net])
+
+    def local_segment(net: str, start: tuple[float, float], end: tuple[float, float]) -> str:
+        return (
+            "  (segment\n"
+            f"    (start {start[0]:.3f} {start[1]:.3f})\n"
+            f"    (end {end[0]:.3f} {end[1]:.3f})\n"
+            f'    (layer "{F_CU}")\n'
+            f"    (net {local_route_net_attr(net)}))"
+        )
+
+    parts = [
+        "(kicad_pcb",
+        _board_layers(),
+        _stackup(),
+    ]
+    if net_format == "ordinal":
+        parts.extend(
+            [
+                "  (net 0 \"\")",
+                "  (net 1 \"/SNAKE_A\")",
+                "  (net 2 \"/SNAKE_DST_A\")",
+                "  (net 3 \"/SNAKE_B\")",
+                "  (net 4 \"/SNAKE_DST_B\")",
+            ]
+        )
+
+    parts.extend(
+        [
+            _footprint(
+                "U1",
+                "snake-u1-uuid",
+                0.0,
+                0.0,
+                [
+                    _pad("1", "thru_hole", "circle", net_format, layers=(ALL_CU,), net="/SNAKE_A", size=(0.4, 0.4)),
+                ],
+            ),
+            _footprint(
+                "J1",
+                "snake-j1-uuid",
+                14.0,
+                0.0,
+                [
+                    _pad("1", "thru_hole", "circle", net_format, layers=(ALL_CU,), net="/SNAKE_DST_A", size=(0.4, 0.4)),
+                ],
+            ),
+            _footprint(
+                "R1",
+                "snake-r1-uuid",
+                3.5,
+                0.0,
+                [
+                    _pad("1", "smd", "rect", net_format, at=(-0.5, 0.0, 0.0), layers=(F_CU,), net="/SNAKE_A", size=(0.4, 0.4)),
+                    _pad("2", "smd", "rect", net_format, at=(0.5, 0.0, 0.0), layers=(F_CU,), net="/SNAKE_DST_A", size=(0.4, 0.4)),
+                ],
+            ),
+            _footprint(
+                "U2",
+                "snake-u2-uuid",
+                0.0,
+                10.0,
+                [
+                    _pad("1", "thru_hole", "circle", net_format, layers=(ALL_CU,), net="/SNAKE_B", size=(0.4, 0.4)),
+                ],
+            ),
+            _footprint(
+                "J2",
+                "snake-j2-uuid",
+                11.0,
+                10.0,
+                [
+                    _pad("1", "thru_hole", "circle", net_format, layers=(ALL_CU,), net="/SNAKE_DST_B", size=(0.4, 0.4)),
+                ],
+            ),
+            _footprint(
+                "R2",
+                "snake-r2-uuid",
+                3.5,
+                10.0,
+                [
+                    _pad("1", "smd", "rect", net_format, at=(-0.5, 0.0, 0.0), layers=(F_CU,), net="/SNAKE_B", size=(0.4, 0.4)),
+                    _pad("2", "smd", "rect", net_format, at=(0.5, 0.0, 0.0), layers=(F_CU,), net="/SNAKE_DST_B", size=(0.4, 0.4)),
+                ],
+            ),
+            local_segment("/SNAKE_A", (0.0, 0.0), (3.0, 0.0)),
+            local_segment("/SNAKE_DST_A", (4.0, 0.0), (14.0, 0.0)),
+            local_segment("/SNAKE_B", (0.0, 10.0), (3.0, 10.0)),
+            local_segment("/SNAKE_DST_B", (4.0, 10.0), (5.0, 10.0)),
+            local_segment("/SNAKE_DST_B", (5.0, 10.0), (5.0, 11.0)),
+            local_segment("/SNAKE_DST_B", (5.0, 11.0), (9.0, 11.0)),
+            local_segment("/SNAKE_DST_B", (9.0, 11.0), (9.0, 10.0)),
+            local_segment("/SNAKE_DST_B", (9.0, 10.0), (10.0, 10.0)),
+            local_segment("/SNAKE_DST_B", (10.0, 10.0), (11.0, 10.0)),
+            ")",
+        ]
+    )
+
+    path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    return path

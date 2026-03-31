@@ -13,6 +13,7 @@ from .core import (
     resolve_regex_measurements,
     summarize_results,
 )
+from .match import match_regex_measurements
 from .types import MeasurementResult, SummaryMetrics
 from .validation import ValidationError, ResourceLimitError, TimeoutError
 
@@ -21,6 +22,7 @@ __all__ = [
     "build_arg_parser",
     "format_length",
     "load_board",
+    "match_regex_measurements",
     "main",
     "measure",
     "render_results_table",

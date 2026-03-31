@@ -18,6 +18,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
+from .match import DEFAULT_MATCH_TOLERANCE_MM, match_regex_measurements
 from .types import GraphEndpoints, MeasurementResult, SExp, SummaryMetrics
 from .validation import (
     MAX_PATHFINDING_TIME_SECONDS,
@@ -35,6 +36,7 @@ __all__ = [
     "build_arg_parser",
     "format_length",
     "load_board",
+    "match_regex_measurements",
     "main",
     "measure",
     "render_results_table",
@@ -342,6 +344,7 @@ class Track:
     end_mm: tuple[float, float]
     mid_mm: tuple[float, float] | None
     length_mm: float
+    source_index: int
 
 
 @dataclass(frozen=True)
@@ -368,6 +371,7 @@ class Edge:
     net: str | None
     layer: str | None
     detail: str | None
+    board_item_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -520,32 +524,39 @@ def parse_stackup(root: SExp, fallback_copper_layers: tuple[str, ...]) -> Stacku
 
 def parse_tracks(root: SExp, nets_by_ordinal: dict[str, str]) -> tuple[Track, ...]:
     result: list[Track] = []
-    for kind in ("segment", "arc"):
-        for node in child_nodes(root, kind):
-            net = resolve_net_name(first_child(node, "net"), nets_by_ordinal)
-            layer = atom(first_child(node, "layer"), 1)
-            start_node = first_child(node, "start")
-            end_node = first_child(node, "end")
-            if not net or not layer or not start_node or not end_node:
-                continue
-            start = (float_atom(start_node, 1, 0.0) or 0.0, float_atom(start_node, 2, 0.0) or 0.0)
-            end = (float_atom(end_node, 1, 0.0) or 0.0, float_atom(end_node, 2, 0.0) or 0.0)
-            mid_node = first_child(node, "mid")
-            mid = None
-            if mid_node is not None:
-                mid = (float_atom(mid_node, 1, 0.0) or 0.0, float_atom(mid_node, 2, 0.0) or 0.0)
-            length_mm = distance(start, end) if kind == "segment" else arc_length(start, mid or start, end)
-            result.append(
-                Track(
-                    kind=kind,
-                    net=net,
-                    layer=layer,
-                    start_mm=start,
-                    end_mm=end,
-                    mid_mm=mid,
-                    length_mm=length_mm,
-                )
+    if not isinstance(root, list):
+        return ()
+    for source_index, node in enumerate(root[1:], start=1):
+        if not isinstance(node, list) or not node:
+            continue
+        kind = atom(node, 0)
+        if kind not in {"segment", "arc"}:
+            continue
+        net = resolve_net_name(first_child(node, "net"), nets_by_ordinal)
+        layer = atom(first_child(node, "layer"), 1)
+        start_node = first_child(node, "start")
+        end_node = first_child(node, "end")
+        if not net or not layer or not start_node or not end_node:
+            continue
+        start = (float_atom(start_node, 1, 0.0) or 0.0, float_atom(start_node, 2, 0.0) or 0.0)
+        end = (float_atom(end_node, 1, 0.0) or 0.0, float_atom(end_node, 2, 0.0) or 0.0)
+        mid_node = first_child(node, "mid")
+        mid = None
+        if mid_node is not None:
+            mid = (float_atom(mid_node, 1, 0.0) or 0.0, float_atom(mid_node, 2, 0.0) or 0.0)
+        length_mm = distance(start, end) if kind == "segment" else arc_length(start, mid or start, end)
+        result.append(
+            Track(
+                kind=kind,
+                net=net,
+                layer=layer,
+                start_mm=start,
+                end_mm=end,
+                mid_mm=mid,
+                length_mm=length_mm,
+                source_index=source_index,
             )
+        )
     return tuple(result)
 
 
@@ -640,14 +651,20 @@ def load_board(path: Path) -> BoardModel:
     """
     logger.info(f"Loading KiCad PCB file: {path}")
     validate_file_size(path)
-
     text = path.read_text(encoding="utf-8")
+    return load_board_from_text(text)
+
+
+def parse_board_root(text: str) -> list[SExp | str]:
     logger.debug(f"File size: {len(text)} characters")
 
     root = parse_sexp(text)
     if not isinstance(root, list) or not root or root[0] != "kicad_pcb":
         raise BoardParseError("root expression is not a kicad_pcb board")
+    return root
 
+
+def build_board_model(root: list[SExp | str]) -> BoardModel:
     nets_by_ordinal = parse_net_table(root)
     logger.debug(f"Found {len(nets_by_ordinal)} nets")
 
@@ -668,6 +685,20 @@ def load_board(path: Path) -> BoardModel:
         tracks=tracks,
         vias=vias,
     )
+
+
+def load_board_from_text(text: str) -> BoardModel:
+    root = parse_board_root(text)
+    return build_board_model(root)
+
+
+def load_board_document(path: Path) -> tuple[str, list[SExp | str], BoardModel]:
+    logger.info(f"Loading KiCad PCB file: {path}")
+    validate_file_size(path)
+    text = path.read_text(encoding="utf-8")
+    root = parse_board_root(text)
+    board = build_board_model(root)
+    return text, root, board
 
 
 def resolve_pad(board: BoardModel, selector: str) -> Pad:
@@ -1008,6 +1039,7 @@ def build_graph(
         net: str | None,
         layer: str | None,
         detail: str | None,
+        board_item_index: int | None = None,
     ) -> None:
         nonlocal edge_counter
         edge = Edge(
@@ -1021,6 +1053,7 @@ def build_graph(
             net=net,
             layer=layer,
             detail=detail,
+            board_item_index=board_item_index,
         )
         edge_counter += 1
         edges.append(edge)
@@ -1046,6 +1079,7 @@ def build_graph(
             net=track.net,
             layer=track.layer,
             detail=None,
+            board_item_index=track.source_index,
         )
 
     via_nodes_by_layer: list[tuple[Via, str, int]] = []
@@ -1391,6 +1425,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
   kicad-signal-path v1.kicad_pcb --start U1:B3 --end J1:H23 --verbose
   kicad-signal-path v1.kicad_pcb --src-net-regex '/AXIS_I_(.*)/' --dst-net-template '/FMC_AXIS_I_($1)/'
   kicad-signal-path v1.kicad_pcb --src-net-regex '/FMC_AXIS_O_(.*)/' --dst-net-template '/AXIS_O_($1)/'
+  kicad-signal-path v1.kicad_pcb --src-net-regex '/AXIS_I_(.*)/' --dst-net-template '/FMC_AXIS_I_($1)/' --match
 
 Selector rules:
   Pad selectors use REF:PAD, for example U1:B3.
@@ -1404,6 +1439,7 @@ Report notes:
   Pass-through parts are crossed when explicitly listed with --pass-through or auto-selected by default.
   Auto selection only considers exact 2-pin resistor-style refs matching R*.
   Use --no-auto-pass-through to disable auto selection.
+  --match lengthens shorter paths up to the longest path and does not run any clearance checks.
 """,
     )
     parser.add_argument("board", type=Path, help="Path to the KiCad .kicad_pcb file to inspect.")
@@ -1446,6 +1482,22 @@ Report notes:
         "--allow-alternative-paths",
         action="store_true",
         help="Report the shortest path even if multiple routed alternatives exist instead of treating that as an error.",
+    )
+    parser.add_argument(
+        "--match",
+        action="store_true",
+        help="In regex batch mode, extend shorter successful paths up to the longest route within tolerance. By default this overwrites the input board and does not run DRC or clearance checks.",
+    )
+    parser.add_argument(
+        "--match-tolerance-mm",
+        type=float,
+        default=DEFAULT_MATCH_TOLERANCE_MM,
+        help=f"Allow final matched paths to differ by up to this amount in millimeters. Default: {DEFAULT_MATCH_TOLERANCE_MM:.3f}.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Write the matched board to a different .kicad_pcb path instead of overwriting the input. Only used with --match.",
     )
     parser.add_argument(
         "--verbose",
@@ -1569,37 +1621,78 @@ def render_results_table(results: list[dict[str, object]], include_via_length: b
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    matched_output: Path | None = None
+    match_changes: list[dict[str, object]] = []
 
     try:
-        board = load_board(args.board)
-        if args.start and args.end:
-            result = measure(
-                board=board,
-                start_selector=args.start,
-                end_selector=args.end,
-                allowed_pass_through_refs=set(args.pass_through_refs),
-                include_via_length=not args.exclude_via_height,
-                allow_alternative_paths=args.allow_alternative_paths,
-                auto_pass_through=args.auto_pass_through,
-            )
-            results = [result]
-        elif args.src_net_regex and args.dst_net_template:
-            results = resolve_regex_measurements(
-                board=board,
+        if args.output is not None and not args.match:
+            raise ValueError("--output can only be used together with --match")
+        if args.match:
+            if args.start or args.end or not args.src_net_regex or not args.dst_net_template:
+                raise ValueError("--match requires --src-net-regex and --dst-net-template, and cannot be used with --start/--end")
+            matched_output, results, match_changes = match_regex_measurements(
+                board_path=args.board,
                 src_net_regex=args.src_net_regex,
                 dst_net_template=args.dst_net_template,
                 explicit_pass_through_refs=set(args.pass_through_refs),
                 include_via_length=not args.exclude_via_height,
                 allow_alternative_paths=args.allow_alternative_paths,
                 auto_pass_through=args.auto_pass_through,
+                tolerance_mm=args.match_tolerance_mm,
+                output_path=args.output,
             )
         else:
-            raise ValueError("use either --start/--end or --src-net-regex/--dst-net-template")
+            board = load_board(args.board)
+            if args.start and args.end:
+                result = measure(
+                    board=board,
+                    start_selector=args.start,
+                    end_selector=args.end,
+                    allowed_pass_through_refs=set(args.pass_through_refs),
+                    include_via_length=not args.exclude_via_height,
+                    allow_alternative_paths=args.allow_alternative_paths,
+                    auto_pass_through=args.auto_pass_through,
+                )
+                results = [result]
+            elif args.src_net_regex and args.dst_net_template:
+                results = resolve_regex_measurements(
+                    board=board,
+                    src_net_regex=args.src_net_regex,
+                    dst_net_template=args.dst_net_template,
+                    explicit_pass_through_refs=set(args.pass_through_refs),
+                    include_via_length=not args.exclude_via_height,
+                    allow_alternative_paths=args.allow_alternative_paths,
+                    auto_pass_through=args.auto_pass_through,
+                )
+            else:
+                raise ValueError("use either --start/--end or --src-net-regex/--dst-net-template")
     except (BoardParseError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     print(render_results_table(results, include_via_length=not args.exclude_via_height))
+
+    if args.match:
+        print()
+        if match_changes:
+            print(
+                f"Match applied: updated={len(match_changes)}, "
+                f"tolerance={format_length(args.match_tolerance_mm)}, "
+                f"board={matched_output}"
+            )
+            for change in match_changes:
+                print(
+                    f"- {change['source_net']} -> {change['destination_net']}: "
+                    f"added {format_length(float(change['length_adjustment_mm']))} on {change['matched_track_layer']}"
+                )
+        else:
+            if matched_output is not None and matched_output != args.board:
+                print(
+                    f"Match mode: all successful paths were already within {format_length(args.match_tolerance_mm)}; "
+                    f"copied board to {matched_output}"
+                )
+            else:
+                print(f"Match mode: all successful paths were already within {format_length(args.match_tolerance_mm)}.")
 
     summary = summarize_results(results)
     if summary["successful_count"] and summary["successful_count"] > 1:
