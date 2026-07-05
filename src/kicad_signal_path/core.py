@@ -1004,13 +1004,48 @@ def resolve_regex_measurements(
     return results
 
 
-def build_graph(
-    board: BoardModel,
-    start_pad: Pad,
-    end_pad: Pad,
-    allowed_pass_through_footprints: set[str],
-    include_via_length: bool,
-) -> tuple[dict[int, list[tuple[int, Edge]]], dict[int, tuple[object, ...]], list[Edge], dict[str, int]]:
+@dataclass(frozen=True)
+class BaseGraph:
+    """Board-level routing graph shared by every measurement on one board.
+
+    Everything here depends only on the board and ``include_via_length``: the track
+    and via edges, the point nodes, and the pad-attachment edges. The only per-pair
+    additions are the pass-through bridge edges and endpoint selection, which are
+    cheap, so this is built once and reused across a whole regex batch.
+    """
+    reverse_nodes: dict[int, tuple[object, ...]]
+    adjacency: dict[int, list[tuple[int, Edge]]]
+    edges: list[Edge]
+    pad_anchor_nodes: dict[tuple[str, str], int]
+    pads_by_footprint: dict[str, list[Pad]]
+    ref_by_uuid: dict[str, str]
+    uuids_by_ref: dict[str, set[str]]
+
+
+# Cache the base graph so a batch of measurements on the same board does not rebuild
+# it per pad pair (the pad-attachment scan is O(pads x points) and dominates runtime).
+# Keyed by board identity plus include_via_length; the board reference is kept in the
+# value so its id() cannot be recycled by another object while the entry is live.
+_BASE_GRAPH_CACHE: dict[tuple[int, bool], tuple["BoardModel", BaseGraph]] = {}
+
+
+def clear_base_graph_cache() -> None:
+    """Drop all cached base graphs (call after mutating a board in place)."""
+    _BASE_GRAPH_CACHE.clear()
+
+
+def get_base_graph(board: BoardModel, include_via_length: bool) -> BaseGraph:
+    """Return the cached base graph for this board, building and caching it if needed."""
+    key = (id(board), include_via_length)
+    cached = _BASE_GRAPH_CACHE.get(key)
+    if cached is not None and cached[0] is board:
+        return cached[1]
+    base = build_base_graph(board, include_via_length)
+    _BASE_GRAPH_CACHE[key] = (board, base)
+    return base
+
+
+def build_base_graph(board: BoardModel, include_via_length: bool) -> BaseGraph:
     node_ids: dict[tuple[object, ...], int] = {}
     reverse_nodes: dict[int, tuple[object, ...]] = {}
     adjacency: dict[int, list[tuple[int, Edge]]] = defaultdict(list)
@@ -1153,6 +1188,69 @@ def build_graph(
                         detail=pad_display_name(pad, ref_by_uuid, uuids_by_ref),
                     )
 
+    node_count = len(reverse_nodes)
+    edge_count = len(edges)
+    validate_graph_size(node_count, edge_count)
+    logger.info(f"Built base routing graph: {node_count} nodes, {edge_count} edges")
+
+    return BaseGraph(
+        reverse_nodes=reverse_nodes,
+        adjacency=dict(adjacency),
+        edges=edges,
+        pad_anchor_nodes=pad_anchor_nodes,
+        pads_by_footprint=pads_by_footprint,
+        ref_by_uuid=ref_by_uuid,
+        uuids_by_ref=uuids_by_ref,
+    )
+
+
+def build_graph(
+    board: BoardModel,
+    start_pad: Pad,
+    end_pad: Pad,
+    allowed_pass_through_footprints: set[str],
+    include_via_length: bool,
+) -> tuple[dict[int, list[tuple[int, Edge]]], dict[int, tuple[object, ...]], list[Edge], dict[str, int]]:
+    """Overlay per-pair pass-through edges onto the cached base graph.
+
+    The base graph (tracks, vias, pad attachments) is identical for every pad pair on
+    a board, so it is built once and cached. Here we copy only the touched adjacency
+    lists and the edge list, append the pass-through bridge edges for this pair, and
+    pick the endpoint nodes. This keeps per-pair work proportional to the number of
+    bridges instead of the whole board.
+    """
+    base = get_base_graph(board, include_via_length)
+    reverse_nodes = base.reverse_nodes
+    pad_anchor_nodes = base.pad_anchor_nodes
+    pads_by_footprint = base.pads_by_footprint
+    ref_by_uuid = base.ref_by_uuid
+    uuids_by_ref = base.uuids_by_ref
+
+    # Copy-on-write: keep the cached adjacency/edges untouched. Only nodes that gain a
+    # pass-through edge get a fresh adjacency list; everything else shares the base list.
+    edges = list(base.edges)
+    adjacency = dict(base.adjacency)
+    edge_counter = len(base.edges)
+
+    def add_overlay_edge(left: int, right: int, *, detail: str | None) -> None:
+        nonlocal edge_counter
+        edge = Edge(
+            edge_id=edge_counter,
+            a=left,
+            b=right,
+            cost_mm=0.0,
+            track_mm=0.0,
+            via_mm=0.0,
+            kind="pass_through",
+            net=None,
+            layer=None,
+            detail=detail,
+        )
+        edge_counter += 1
+        edges.append(edge)
+        adjacency[left] = [*adjacency.get(left, ()), (right, edge)]
+        adjacency[right] = [*adjacency.get(right, ()), (left, edge)]
+
     for footprint_uuid in allowed_pass_through_footprints:
         footprint_pads = pads_by_footprint.get(footprint_uuid)
         if not footprint_pads:
@@ -1161,17 +1259,9 @@ def build_graph(
             label = footprint_display_name(footprint_uuid, ref_by_uuid, uuids_by_ref)
             raise ValueError(f"pass-through footprint '{label}' must have exactly 2 copper pads, found {len(footprint_pads)}")
         left_pad, right_pad = footprint_pads
-        left_anchor = pad_anchor_nodes[left_pad.instance_key]
-        right_anchor = pad_anchor_nodes[right_pad.instance_key]
-        add_edge(
-            left_anchor,
-            right_anchor,
-            cost_mm=0.0,
-            track_mm=0.0,
-            via_mm=0.0,
-            kind="pass_through",
-            net=None,
-            layer=None,
+        add_overlay_edge(
+            pad_anchor_nodes[left_pad.instance_key],
+            pad_anchor_nodes[right_pad.instance_key],
             detail=footprint_display_name(footprint_uuid, ref_by_uuid, uuids_by_ref),
         )
 
@@ -1182,14 +1272,7 @@ def build_graph(
     if end_node not in adjacency:
         raise ValueError(f"end pad '{pad_display_name(end_pad, ref_by_uuid, uuids_by_ref)}' has no routed copper touching it")
 
-    # Validate graph size
-    node_count = len(reverse_nodes)
-    edge_count = len(edges)
-    validate_graph_size(node_count, edge_count)
-
-    logger.info(f"Built routing graph: {node_count} nodes, {edge_count} edges")
     logger.debug(f"Start node: {start_node}, End node: {end_node}")
-
     endpoint_nodes = {"start": start_node, "end": end_node}
     return adjacency, reverse_nodes, edges, endpoint_nodes
 
